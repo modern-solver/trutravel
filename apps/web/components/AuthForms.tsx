@@ -2,10 +2,16 @@
 
 import Link from "next/link";
 import { useState, type FormEvent } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+
+function safeNextPath(raw: string | null): string | null {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  return raw;
+}
 
 export function SignupForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -29,7 +35,7 @@ export function SignupForm() {
       setError(data.error ?? "Signup failed.");
       return;
     }
-    router.push("/profile");
+    router.push(safeNextPath(searchParams.get("next")) ?? "/profile");
     router.refresh();
   }
 
@@ -61,6 +67,7 @@ export function SignupForm() {
 
 export function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -83,7 +90,7 @@ export function LoginForm() {
       setError(data.error ?? "Login failed.");
       return;
     }
-    router.push("/");
+    router.push(safeNextPath(searchParams.get("next")) ?? "/");
     router.refresh();
   }
 

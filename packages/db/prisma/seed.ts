@@ -16,6 +16,12 @@ import { PrismaClient } from "@prisma/client";
 const prisma = new PrismaClient();
 
 async function main() {
+  const existingTrip = await prisma.trip.findFirst({ where: { isPublished: true } });
+  if (existingTrip) {
+    console.log("Seed skipped — published trips already exist:", existingTrip.id);
+    return;
+  }
+
   await prisma.segment.createMany({
     data: [
       { key: "trippy_tours", name: "Trippy Tours", accentTokenKey: "trippy", catalogLive: true, sortOrder: 0 },

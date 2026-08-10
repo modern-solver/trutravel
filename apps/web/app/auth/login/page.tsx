@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { LoginForm } from "@/components/AuthForms";
 
 export default function LoginPage() {
@@ -8,7 +9,9 @@ export default function LoginPage() {
           Log in
         </h1>
         <p className="t-meta">Email + password for this slice. Phone OTP path remains on the API.</p>
-        <LoginForm />
+        <Suspense fallback={<p className="form-note">Loading…</p>}>
+          <LoginForm />
+        </Suspense>
       </div>
     </main>
   );

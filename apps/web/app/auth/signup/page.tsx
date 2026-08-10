@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { SignupForm } from "@/components/AuthForms";
 
 export default function SignupPage() {
@@ -8,7 +9,9 @@ export default function SignupPage() {
           Sign up
         </h1>
         <p className="t-meta">Age gate runs once here — never re-asked per booking.</p>
-        <SignupForm />
+        <Suspense fallback={<p className="form-note">Loading…</p>}>
+          <SignupForm />
+        </Suspense>
       </div>
     </main>
   );
