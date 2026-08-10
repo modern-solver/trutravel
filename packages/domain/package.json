@@ -1,0 +1,14 @@
+{
+  "name": "@trutravel/domain",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "description": "Framework-free TruTravel domain logic: catalog policy, matching (P3 TKT-008 rubric), booking state machine. No DB or HTTP dependencies — unit-testable in isolation (see T5 handoff in docs/architecture/platform-architecture.md).",
+  "dependencies": {
+    "@trutravel/db": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,506 @@
+// TruTravel domain model — Himachal x Thrilling + Himachal x Trippy vertical slice (TKT-010).
+// Shared domain model per P1's instruction (himachal-thrilling.md §3, himachal-trippy.md §3):
+// "T1 does not have to reconcile two schemas." One Trip/Departure/Seat lifecycle; segment-specific
+// attributes live in extension tables (see docs/architecture/platform-architecture.md §4.2).
+//
+// IMPORTANT: this file does not, by itself, enforce the Kasol/Parvati hard exclusion for Trippy
+// Tours. See prisma/sql/hard_constraints.sql — Prisma's schema DSL does not support arbitrary
+// CHECK constraints, so that constraint ships as a companion raw-SQL migration step. Do not
+// consider the Parvati exclusion "done" without also applying that file. See platform-architecture.md §5.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SegmentKey {
+  trippy_tours
+  thrilling_tours
+  wellness_tours
+  couple_getaways
+  codehouses
+  festivals
+}
+
+// Corridor sub-locations. `kasol_parvati` is present for domain-model consistency across the
+// corridor (Trippy PRD §3) but must never be assignable to a Trippy Trip — see hard_constraints.sql.
+// `spiti` is future for both segments (altitude/supply-readiness, not a legal exclusion).
+enum SubLocation {
+  manali
+  bir
+  kasol_parvati
+  spiti
+}
+
+enum AltitudeTier {
+  standard
+  high_altitude
+}
+
+enum DepartureState {
+  open
+  filling
+  waitlist
+  locked
+  cancelled
+}
+
+enum SeatState {
+  pending
+  confirmed
+  refund_pending
+  refunded
+  cancelled
+}
+
+// Structural distinguishability requirement, both PRDs §8: an operator-initiated cancellation
+// (weather abort, permit issue, insufficient minimum group size) must never be reportable as if it
+// were a traveler-initiated one, even though the traveler-facing "Refunded" badge can look the same.
+enum CancellationReasonCode {
+  traveler_initiated
+  operator_weather_abort
+  operator_permit_issue
+  operator_min_group_not_met
+  other_operator_initiated
+}
+
+enum PartnerVerificationState {
+  unverified
+  under_review
+  verified
+  suspended
+}
+
+enum PartnerTier {
+  t1
+  t2
+  t3
+}
+
+// Shared platform-wide verification tier, reused across Captains, CodeHouse guests (future), etc.
+// per risk-register §1's instruction not to build a parallel identity-verification system per segment.
+enum IdentityVerificationLevel {
+  none
+  basic
+  professional_verified
+}
+
+enum TrainingType {
+  trippy_code_of_conduct
+}
+
+// --- Thrilling tag/requirement enums (matching-v0 §1.1, Thrilling PRD §3) ---
+
+enum SkillLevel {
+  beginner
+  intermediate
+  advanced
+  expert
+}
+
+enum FitnessLevel {
+  low
+  moderate
+  high
+  athlete
+}
+
+enum RiskAppetite {
+  cautious
+  moderate
+  high
+}
+
+enum CertificationHeldLevel {
+  none
+  basic
+  advanced
+  professional
+}
+
+enum GearOwnership {
+  none
+  partial
+  full
+}
+
+// --- Trippy tag enums (matching-v0 §1.2, Trippy PRD §7) ---
+// NOTE: there is intentionally no substance_stance-equivalent enum anywhere in this file.
+// See TrippyTravelerProfile below and platform-architecture.md §6.1 for the explicit audit.
+
+enum PacePreference {
+  unplanned
+  loosely_planned
+  structured
+}
+
+enum GroupSizePref {
+  micro_4_6
+  standard_8_12
+  large_12_plus
+}
+
+enum NoiseEnergy {
+  chill
+  moderate
+  high_energy
+}
+
+enum SpiritualOpenness {
+  none
+  curious
+  practicing
+}
+
+enum PhotographyComfort {
+  private
+  ask_first
+  open
+}
+
+// ---------------------------------------------------------------------------
+// Segment catalog metadata (P2 Home six-tile grid — segment is first-class, not a tag)
+// ---------------------------------------------------------------------------
+
+model Segment {
+  key            SegmentKey @id
+  name           String
+  accentTokenKey String // ties to P2's design-token system, e.g. "thrilling" / "trippy"
+  catalogLive    Boolean    @default(false) // whether Trip creation/browse is enabled for this segment
+  sortOrder      Int // default logged-out Home order (Shared Context §2 canonical list)
+
+  trips Trip[]
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String?   @unique
+  phone        String?   @unique
+  passwordHash String? // optional — OTP-first auth is the primary path for India (see auth module)
+  dateOfBirth  DateTime
+  // Set once, at signup, if dateOfBirth clears the platform-wide 18+ gate (A4 risk-register §1;
+  // both PRDs §9/§5 confirm this is never re-derived per segment or re-asked per booking).
+  ageGatePassedAt DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  profile          Profile?
+  thrillingProfile ThrillingTravelerProfile?
+  trippyProfile    TrippyTravelerProfile?
+  loyaltyCounts    LoyaltySegmentCount[]
+  seats            Seat[]
+  captain          Captain?
+  operatorStaff    PartnerStaff[]
+  overridesGiven   MatchOverride[]           @relation("OverriddenBy")
+
+  @@index([phone])
+  @@index([email])
+}
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  emergencyContactName     String?
+  emergencyContactPhone    String?
+  emergencyContactRelation String?
+
+  // Risk-register §1: encrypt at rest, access scoped to captain/operator of the traveler's active
+  // trip only. NOT implemented as encryption in this ticket — flagged to T4 (platform-architecture.md §8).
+  medicalDisclosure String?
+
+  waiverAcceptedAt          DateTime?
+  identityVerificationLevel IdentityVerificationLevel @default(none)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Corridor / catalog
+// ---------------------------------------------------------------------------
+
+model Corridor {
+  id   String @id @default(cuid())
+  name String @unique // "Himachal Adventure Belt"
+
+  trips Trip[]
+}
+
+model Trip {
+  id           String     @id @default(cuid())
+  corridorId   String
+  corridor     Corridor   @relation(fields: [corridorId], references: [id])
+  segment      SegmentKey
+  segmentRef   Segment    @relation(fields: [segment], references: [key])
+  subLocation  SubLocation
+  title        String
+  durationDays Int
+  // Flat price per Departure at MVP — no dynamic pricing (both PRDs §10/§9). Do not build
+  // price-compatibility matching logic against this field (matching-v0 §1.3).
+  priceINR   Int
+  partnerId  String
+  partner    Partner  @relation(fields: [partnerId], references: [id])
+  isPublished Boolean @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  thrillingDetail ThrillingTripDetail?
+  trippyDetail    TrippyTripDetail?
+  departures      Departure[]
+
+  @@index([segment, subLocation, isPublished])
+}
+
+// Segment-specific Trip requirements. See prisma/sql/hard_constraints.sql for the DB-level
+// enforcement that no Trip with segment=trippy_tours may carry subLocation=kasol_parvati.
+model ThrillingTripDetail {
+  tripId String @id
+  trip   Trip   @relation(fields: [tripId], references: [id])
+
+  activityType   String // trek | climb | water_sports | motorsport | wildlife_expedition | winter_sports | multi_activity
+  skillLevelMin  SkillLevel
+  // Null => not a physically-demanding SKU; fitness gate not enforced (Thrilling PRD §9, matching-v0 §2.1.7)
+  fitnessLevelMin FitnessLevel?
+  maxAltitudeM    Int
+  // Derived from maxAltitudeM by the domain layer at write time (packages/domain/src/catalog/policy.ts),
+  // stored for query performance. Every Trip published for the September catalog must be `standard`
+  // (Thrilling PRD §7) — enforced at the application publish gate, not a DB constraint, since this
+  // is a time-bound scope cut expected to lift once G4 sources an insurance partner.
+  altitudeTier AltitudeTier
+
+  requiresCertification  Boolean @default(false)
+  certificationRequired  String? // free-text ref, only meaningful if requiresCertification = true
+
+  guideId String?
+  guide   Guide?  @relation(fields: [guideId], references: [id])
+}
+
+model TrippyTripDetail {
+  tripId String @id
+  trip   Trip   @relation(fields: [tripId], references: [id])
+
+  pacePreference PacePreference
+  groupSizePref  GroupSizePref
+}
+
+// ---------------------------------------------------------------------------
+// Partner (Anchor Operator) / Guide
+// ---------------------------------------------------------------------------
+
+model Partner {
+  id                      String                    @id @default(cuid())
+  legalName               String
+  businessRegistrationRef String?
+  gstNumber               String?
+  insuranceCertRef        String?
+  verificationState       PartnerVerificationState  @default(unverified)
+  createdAt               DateTime                  @default(now())
+  updatedAt               DateTime                  @updatedAt
+
+  segmentTiers PartnerSegmentTier[]
+  trips        Trip[]
+  guides       Guide[]
+  staff        PartnerStaff[]
+}
+
+// Tier is scoped per segment, never inherited across an operator's segments (A2 unit-economics.md
+// §1.4/§2 explicit flag — an Indiahikes/Bikat-class T1 Thrilling operator does not automatically
+// get T1 Trippy payout terms).
+model PartnerSegmentTier {
+  id          String      @id @default(cuid())
+  partnerId   String
+  partner     Partner     @relation(fields: [partnerId], references: [id])
+  segment     SegmentKey
+  tier        PartnerTier
+  qualifiedAt DateTime    @default(now())
+
+  @@unique([partnerId, segment])
+}
+
+model PartnerStaff {
+  id        String  @id @default(cuid())
+  partnerId String
+  partner   Partner @relation(fields: [partnerId], references: [id])
+  userId    String
+  user      User    @relation(fields: [userId], references: [id])
+  role      String // e.g. "owner", "ops" — informal at MVP, not a full RBAC model
+
+  @@unique([partnerId, userId])
+}
+
+// Anchor-Operator-layer certified technical guide — distinct from TruTravel's Captain role
+// (Thrilling PRD §6). Belongs to a Partner, not to TruTravel's identity/verification system.
+model Guide {
+  id                  String   @id @default(cuid())
+  partnerId           String
+  partner             Partner  @relation(fields: [partnerId], references: [id])
+  name                String
+  certificationRef    String
+  certificationGrade  String?
+  createdAt           DateTime @default(now())
+
+  thrillingTripDetails ThrillingTripDetail[]
+}
+
+// ---------------------------------------------------------------------------
+// Captain
+// ---------------------------------------------------------------------------
+
+model Captain {
+  id                        String                    @id @default(cuid())
+  userId                    String                    @unique
+  user                      User                      @relation(fields: [userId], references: [id])
+  identityVerificationLevel IdentityVerificationLevel @default(none)
+  createdAt                 DateTime                  @default(now())
+
+  trainings  CaptainTraining[]
+  departures Departure[]
+}
+
+// Trippy-specific gate (Trippy PRD §6): a Captain must complete trippy_code_of_conduct training
+// before being assignable to a live Trippy Departure. Thrilling has no equivalent training
+// requirement at MVP — only basic identity verification (Thrilling PRD §6, §10).
+model CaptainTraining {
+  id           String       @id @default(cuid())
+  captainId    String
+  captain      Captain      @relation(fields: [captainId], references: [id])
+  trainingType TrainingType
+  completedAt  DateTime
+
+  @@unique([captainId, trainingType])
+}
+
+// ---------------------------------------------------------------------------
+// Departure / Seat
+// ---------------------------------------------------------------------------
+
+model Departure {
+  id         String         @id @default(cuid())
+  tripId     String
+  trip       Trip           @relation(fields: [tripId], references: [id])
+  dateStart  DateTime
+  dateEnd    DateTime
+  capacity   Int
+  state      DepartureState @default(open)
+  captainId  String?
+  captain    Captain?       @relation(fields: [captainId], references: [id])
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  seats          Seat[]
+  matchOverrides MatchOverride[]
+
+  @@index([tripId, state])
+}
+
+model Seat {
+  id             String    @id @default(cuid())
+  departureId    String
+  departure      Departure @relation(fields: [departureId], references: [id])
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  state          SeatState @default(pending)
+  // Links seats booked together in one transaction (matching-v0 §5.3 "locked sub-unit for
+  // placement") — a group booking is not re-scored member-against-member, but every seat still
+  // clears hard gates independently (packages/domain/src/booking/group-booking.ts).
+  groupBookingId String?
+
+  // Two-line-item contract per both PRDs' §8 item 1 (split deposit/balance capture). T1 defines the
+  // shape; T2 populates real values at booking-confirmation/payment time. Never populate these with
+  // a guessed number — see packages/domain/src/booking/refund-policy.ts.
+  depositAmountINR Int?
+  balanceAmountINR Int?
+  totalAmountINR   Int?
+
+  cancellationReasonCode CancellationReasonCode?
+  cancelledAt             DateTime?
+
+  // Audit snapshots — booking-time record of what was evaluated / declared, independent of whether
+  // the traveler's live profile changes later.
+  hardGateResultJson       Json?
+  selfDeclaredSnapshotJson Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matchOverride MatchOverride?
+
+  @@index([departureId, state])
+  @@index([userId])
+}
+
+// Matching-v0 §5.2: the only path that admits a traveler who failed a self-declared hard gate — an
+// explicit, logged, human decision. Never a silent schema bypass.
+model MatchOverride {
+  id             String    @id @default(cuid())
+  seatId         String    @unique
+  seat           Seat      @relation(fields: [seatId], references: [id])
+  departureId    String
+  departure      Departure @relation(fields: [departureId], references: [id])
+  overriddenById String
+  overriddenBy   User      @relation("OverriddenBy", fields: [overriddenById], references: [id])
+  gateFailed     String // which hard gate was bypassed, e.g. "skill_level"
+  reason         String
+  createdAt      DateTime  @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Matching tag storage — segment-namespaced, exhaustive column lists (see
+// platform-architecture.md §4.2 / §6.1 for why this pattern was chosen over a shared EAV table).
+// ---------------------------------------------------------------------------
+
+model ThrillingTravelerProfile {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id])
+
+  skillLevel        SkillLevel
+  fitnessLevel       FitnessLevel
+  riskAppetite       RiskAppetite
+  certificationHeld  CertificationHeldLevel @default(none)
+  gearOwnership      GearOwnership          @default(none) // informational only — never fed into soft-score (matching-v0 §3.1)
+
+  updatedAt DateTime @updatedAt
+}
+
+// This model's field list is EXHAUSTIVE and intentionally so: it is the literal, grep-able answer
+// to "does a substance_stance field or equivalent exist anywhere in this schema?" (Trippy PRD §6,
+// risk-register §9.1, matching-v0 §6). It does not. Adding a field here that reconstructs that
+// signal (e.g. a generically-named "openness"/"vibe_tolerance" field) reopens a founder decision —
+// treat any such change as requiring the same sign-off path A4's §9.1 describes, not a routine PR.
+model TrippyTravelerProfile {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id])
+
+  pacePreference     PacePreference
+  groupSizePref      GroupSizePref
+  noiseEnergy        NoiseEnergy // Trippy-specific meaning (social/expressive energy) — never shared cross-segment (matching-v0 §1.3)
+  spiritualOpenness  SpiritualOpenness
+  photographyComfort PhotographyComfort
+
+  updatedAt DateTime @updatedAt
+}
+
+// Consolidated per P3's recommendation (matching-v0 §1.3): one field scoped by segment, not two
+// parallel prior_thrilling_trips / prior_trippy_trips integer columns.
+model LoyaltySegmentCount {
+  userId  String
+  segment SegmentKey
+  count   Int        @default(0)
+  user    User       @relation(fields: [userId], references: [id])
+
+  @@id([userId, segment])
+}
