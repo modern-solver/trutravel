@@ -8,3 +8,5 @@ build/
 .DS_Store
 .claude/migration-specialist.log
 apps/web/tsconfig.tsbuildinfo
+*.webp
+/opt/cursor/
