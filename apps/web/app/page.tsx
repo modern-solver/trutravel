@@ -1,32 +1,64 @@
 import { prisma } from "@trutravel/db";
+import { SegmentTile } from "@/components/SegmentTile";
+import { formatSubLocation } from "@/lib/segments";
+import type { SegmentKey } from "@trutravel/db";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Functional placeholder Home route — proves the data layer works end-to-end (Segment rows render
- * with equal structural weight, catalogLive as a data fact per platform-architecture.md §4.1). This
- * is NOT P2's designed Home six-tile grid (docs/design/key-screens.md §5.1) — that visual
- * implementation is explicitly out of scope for this ticket (platform-architecture.md §11), a
- * separate FE build item.
+ * Home — six-segment equal-weight grid (docs/design/key-screens.md §5.1).
+ * Pending segments are never grayed out; only inner content differs.
  */
 export default async function HomePage() {
   const segments = await prisma.segment.findMany({ orderBy: { sortOrder: "asc" } });
 
+  const liveStats = await Promise.all(
+    segments
+      .filter((s) => s.catalogLive)
+      .map(async (s) => {
+        const trips = await prisma.trip.findMany({
+          where: { segment: s.key, isPublished: true },
+          select: { subLocation: true, id: true },
+        });
+        const departureCount = await prisma.departure.count({
+          where: {
+            tripId: { in: trips.map((t) => t.id) },
+            state: { in: ["open", "filling"] },
+          },
+        });
+        const locs = [...new Set(trips.map((t) => formatSubLocation(t.subLocation)))];
+        return {
+          key: s.key,
+          text:
+            departureCount > 0
+              ? `${departureCount} departure${departureCount === 1 ? "" : "s"} open · ${locs.join(" + ")}`
+              : "Catalog live — check segment for dates",
+        };
+      })
+  );
+  const liveStatByKey = Object.fromEntries(liveStats.map((s) => [s.key, s.text]));
+
   return (
-    <main style={{ padding: "2rem", fontFamily: "system-ui, sans-serif" }}>
-      <h1>TruTravel</h1>
-      <p>
-        Platform scaffold (TKT-010) — functional placeholder, not P2&apos;s designed Home screen.
-        See <code>docs/design/key-screens.md</code> for the real spec and the API routes under{" "}
-        <code>app/api/</code> for what this screen (and its real implementation) call.
-      </p>
-      <ul>
+    <main>
+      <section className="container home-hero">
+        <h1 className="brand-hero">TruTravel</h1>
+        <p>
+          Six product lines, equal weight. Pick a segment — then browse real departures with trust
+          signals beside price and dates.
+        </p>
+      </section>
+
+      <section className="container segment-grid" aria-label="Segments">
         {segments.map((segment) => (
-          <li key={segment.key}>
-            {segment.name} — {segment.catalogLive ? "live" : "coming soon"}
-          </li>
+          <SegmentTile
+            key={segment.key}
+            segmentKey={segment.key as SegmentKey}
+            name={segment.name}
+            catalogLive={segment.catalogLive}
+            liveStat={liveStatByKey[segment.key]}
+          />
         ))}
-      </ul>
+      </section>
     </main>
   );
 }
