@@ -72,6 +72,53 @@ enum CancellationReasonCode {
   other_operator_initiated
 }
 
+// --- Payments / cancellation engine (GLD-4, prd://payments-cancellation-engine) ---
+
+// The three seat-level payment milestones. Cumulative targets, not per-tranche amounts:
+// deposit = 10% at booking, middle = cumulative 60% by T-14d, final = cumulative 100% by T-48h.
+// T-48h is @user's own wording ("rest 48 hrs prior to the trip itself") — never T-72h.
+enum PaymentMilestoneKey {
+  deposit
+  middle
+  final
+}
+
+enum PaymentMilestoneState {
+  pending
+  met
+  overdue
+}
+
+// Manual capture only — no auto-debit, no RBI e-mandate (PRD "Payments infra").
+enum PaymentState {
+  requires_action
+  succeeded
+  failed
+}
+
+enum RefundState {
+  pending
+  succeeded
+  failed
+}
+
+// Pay-in-full bonus: a physical souvenir the Captain buys locally, NOT a discount and NOT platform
+// credit (PRD "Pay-in-full bonus"). Modeled as a fulfilment obligation on the seat.
+enum SouvenirObligationState {
+  pending
+  captain_purchased
+  delivered
+  written_off
+}
+
+// The three cancellation windows. Fee base is the DEPOSIT in every window — never ticket price,
+// never trip value. See PricingPolicy and packages/domain/src/booking/refund-policy.ts.
+enum CancellationWindow {
+  outside_14d
+  mid_14d_to_48h
+  inside_48h
+}
+
 enum PartnerVerificationState {
   unverified
   under_review
@@ -369,6 +416,7 @@ model Captain {
 
   trainings  CaptainTraining[]
   departures Departure[]
+  souvenirObligations SouvenirObligation[]
 }
 
 // Trippy-specific gate (Trippy PRD §6): a Captain must complete trippy_code_of_conduct training
@@ -419,15 +467,27 @@ model Seat {
   // clears hard gates independently (packages/domain/src/booking/group-booking.ts).
   groupBookingId String?
 
-  // Two-line-item contract per both PRDs' §8 item 1 (split deposit/balance capture). T1 defines the
-  // shape; T2 populates real values at booking-confirmation/payment time. Never populate these with
-  // a guessed number — see packages/domain/src/booking/refund-policy.ts.
+  // Ledger denormalization (GLD-4). Populated at seat creation from the Trip price and the segment's
+  // PricingPolicy — no longer nullable placeholders. `paidAmountINR` is the sum of succeeded
+  // Payments and is only ever recomputed from those immutable rows, never incremented in place.
+  // Invariant: balanceAmountINR = totalAmountINR - paidAmountINR.
   depositAmountINR Int?
   balanceAmountINR Int?
   totalAmountINR   Int?
+  paidAmountINR    Int @default(0)
+
+  // Which versioned PricingPolicy row governed this seat at booking time. Pinned so that editing a
+  // policy later never silently rewrites the cancellation terms a traveler already agreed to.
+  pricingPolicyId String?
+  pricingPolicy   PricingPolicy? @relation(fields: [pricingPolicyId], references: [id])
 
   cancellationReasonCode CancellationReasonCode?
   cancelledAt             DateTime?
+
+  payments            Payment[]
+  paymentMilestones   PaymentMilestone[]
+  refunds             Refund[]
+  souvenirObligation  SouvenirObligation?
 
   // Audit snapshots — booking-time record of what was evaluated / declared, independent of whether
   // the traveler's live profile changes later.
@@ -441,6 +501,169 @@ model Seat {
 
   @@index([departureId, state])
   @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments / cancellation engine (GLD-4, prd://payments-cancellation-engine)
+// ---------------------------------------------------------------------------
+
+// Versioned, per-segment configuration. EVERY percentage in the payments engine reads from here —
+// the ticket is explicit that percentages live in configuration, never as literals in code. Changing
+// a number is a new row (version + 1, previous row `isActive: false`), never a code change, and
+// never an in-place edit: seats pin `pricingPolicyId` so historical terms stay reconstructible.
+//
+// Basis points (1% = 100 bps) throughout, so no percentage is ever stored as a lossy float.
+model PricingPolicy {
+  id      String     @id @default(cuid())
+  segment SegmentKey
+  version Int
+  // Exactly one active row per segment is expected; enforced at write time by the config loader
+  // (packages/payments/src/policy.ts), not by a partial index Prisma cannot express.
+  isActive Boolean @default(true)
+
+  // Payment schedule — CUMULATIVE targets as bps of the seat's total amount.
+  depositBps        Int // 1000 = 10% at booking
+  middleCumulativeBps Int // 6000 = cumulative 60% by T-14d
+  middleMilestoneDaysBefore Int // 14
+  // Final milestone is cumulative 100%, expressed in HOURS before departure (48), because the
+  // user's rule is "48 hrs prior to the trip itself" — a day-granularity field would lose that.
+  finalMilestoneHoursBefore Int // 48
+
+  // Cancellation fee = flatFeeINR + (windowBps * depositAmountINR). Deposit forfeiture is SUBSUMED
+  // into this fee, never stacked on top of it.
+  cancellationFlatFeeINR Int // 1000
+  cancelOutside14dBps    Int // 1000 = 10% of deposit
+  cancelMid14dTo48hBps   Int // 2500 = 25% of deposit
+  cancelInside48hBps     Int // 4000 = 40% of deposit
+
+  // Pay-in-full souvenir reimbursement cap, as bps of the seat's total amount. Captain submissions
+  // above this are REJECTED at the API, never silently capped (PRD "Pay-in-full bonus").
+  souvenirCapBps Int // 100 = 1%
+
+  // How far ahead of a milestone the reminder scan nudges traveler + Captain. A non-zero balance
+  // must surface BEFORE the deadline, not at it (ticket: "ahead of the deadline, not at it").
+  reminderLeadHours Int // 24
+
+  createdAt DateTime @default(now())
+
+  seats Seat[]
+
+  @@unique([segment, version])
+  @@index([segment, isActive])
+}
+
+// One row per seat per milestone, materialized at seat creation so due dates are queryable by the
+// reminder scan without recomputing the schedule for every seat on every run.
+model PaymentMilestone {
+  id     String @id @default(cuid())
+  seatId String
+  seat   Seat   @relation(fields: [seatId], references: [id])
+
+  key PaymentMilestoneKey
+    // Cumulative amount that must be paid by `dueAt` — not the size of this tranche.
+  cumulativeDueINR Int
+  dueAt            DateTime
+  state            PaymentMilestoneState @default(pending)
+  metAt            DateTime?
+    // Last time the reminder scan nudged for this milestone. Null = never nudged.
+  lastRemindedAt DateTime?
+
+  @@unique([seatId, key])
+  @@index([state, dueAt])
+}
+
+// Immutable ledger line. Rows are never updated except for the provider-driven state transition
+// (requires_action -> succeeded|failed) and never deleted. `paidAmountINR` on Seat is always the sum
+// of this table's succeeded rows — the denormalized field is a cache, this table is the truth.
+model Payment {
+  id     String @id @default(cuid())
+  seatId String
+  seat   Seat   @relation(fields: [seatId], references: [id])
+
+  amountINR Int
+  state     PaymentState @default(requires_action)
+
+    // Provider slug at capture time ("manual", or whichever provider is configured). Recorded for
+  // reconciliation only — no code branches on this value (provider stays behind the interface).
+  provider String
+    // Caller-supplied key; a retried intent request with the same key returns the existing row
+  // instead of creating a second one.
+  idempotencyKey String  @unique
+    // Provider's own reference for the charge (order/intent id).
+  providerRef    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  succeededAt DateTime?
+
+  @@index([seatId, state])
+}
+
+model Refund {
+  id     String @id @default(cuid())
+  seatId String
+  seat   Seat   @relation(fields: [seatId], references: [id])
+
+    // What the traveler gets back: max(0, amountPaid - cancellationFee).
+  amountINR         Int
+    // flatFee + pct-of-deposit. Zero for operator-initiated cancellations.
+  cancellationFeeINR Int
+  window            CancellationWindow
+  reasonCode        CancellationReasonCode
+  initiatedBy       String // "traveler" | "operator"
+  state             RefundState @default(pending)
+
+  provider       String
+  idempotencyKey String  @unique
+  providerRef    String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  succeededAt DateTime?
+
+  @@index([seatId, state])
+}
+
+// The pay-in-full bonus as a fulfilment obligation, not money movement. Triggered when cumulative
+// paid reaches 100% by the final milestone; @user accepted that this makes it effectively universal.
+model SouvenirObligation {
+  id     String @id @default(cuid())
+  seatId String @unique
+  seat   Seat   @relation(fields: [seatId], references: [id])
+
+  state SouvenirObligationState @default(pending)
+    // Hard reimbursement ceiling, resolved from PricingPolicy.souvenirCapBps at trigger time.
+  reimbursementCapINR Int
+  spentINR            Int?
+  receiptURL          String?
+    // Captain who owns the purchase task; null until the Departure has a Captain assigned.
+  captainId String?
+  captain   Captain? @relation(fields: [captainId], references: [id])
+
+    // Set when an operator-initiated cancellation happens after purchase: the platform eats the cost
+  // and it is NEVER clawed back from the traveler (PRD "Operator-initiated cancellation").
+  writtenOffAt DateTime?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  purchasedAt DateTime?
+  deliveredAt DateTime?
+
+  @@index([captainId, state])
+}
+
+// The single idempotency gate for the webhook path. Insert-first: a unique-constraint violation on
+// `providerEventId` means this event was already processed, so the handler returns 200 without
+// touching the ledger a second time. ONLY the webhook path mutates the ledger (PRD "Payments infra").
+model PaymentWebhookEvent {
+  id              String   @id @default(cuid())
+  provider        String
+  providerEventId String
+  eventType       String
+  payloadJson     Json
+  receivedAt      DateTime @default(now())
+
+  @@unique([provider, providerEventId])
 }
 
 // Matching-v0 §5.2: the only path that admits a traveler who failed a self-declared hard gate — an
